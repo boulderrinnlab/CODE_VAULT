@@ -1,0 +1,195 @@
+---
+title: "02_checking_fastq"
+author: "JR"
+date: "7/22/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = FALSE)
+library(tidyverse)
+library(httr)
+library(janitor)
+library(purrr)
+source("/scratch/Shares/rinnclass/CLASS_2023/JR/CLASS_2023/util/class_functions.R")
+source("/scratch/Shares/rinnclass/CLASS_2023/JR/CLASS_2023/util/encode_functions.R")
+```
+GOAL: Check that our fastq files are correct, make a design file to run
+NF_CORE ChIPseq pipeline 
+
+We just finished making a sample sheet that has md5sums
+md5sum is a critical bash function that ensures the downloaded file is the same as source
+The internet can cause issues and the downloaded file maybe corrupt (it happens !)
+
+Encode provided us with the "source" md5sum number and we will run md5sum on our fastqs
+then check that they are the same.
+
+We are going to take a quick detour and rename fastq files to match md5sum name
+Note: the name can be different but content is checked to be same as source file
+
+# renaming fastq real quick
+```{r rename fastq files to samplesheet id}
+
+# first let's read in our sample sheet from last class
+samples <- read_csv("/scratch/Shares/rinnclass/CLASS_2023/JR/CLASS_2023/CLASSES/03_Nextflow/01_my_chipseq/samples.csv")
+
+# Rename the fastq files so that they contain the sample ID.
+rename_script <- samples %>%
+  # removes grouping in samples
+  ungroup() %>%
+  dplyr::select(fastq_file, original_file) %>%
+  mutate(command = "mv") %>%
+  unite(command, command, original_file, fastq_file, sep = " ")
+# The result of this is that each row is a bash command.
+# We can write this out as a bash script with ?write_lines 
+# We include a shebang header line so that the script is interpreted by bash.
+?write_lines
+write_lines(c("#!/bin/bash", rename_script$command), "rename.sh")
+# Now cd fastq and "chmod u+x rename.sh
+# then ./rename.sh
+# >>> voila all the files are renamed
+```
+
+
+
+# md5sum check on fastq downloads
+
+```{r md5sum of fastq}
+
+# Let's create an md5.txt to run the checksums
+md5 <- samples %>%
+  #just precautionary since we grouped stuff in last class (map etc)
+  ungroup() %>%
+  # selecting out the md5sum and fastq_file cols
+  dplyr::select(md5sum, fastq_file) %>%
+  # note double space for md5 requirements 
+  unite(line, md5sum, fastq_file, sep = "  ")
+
+# let's take a look -- nice looks good
+
+
+# writting out md5$line col that has the command in it from above.
+write_lines(md5$line, "data/md5.txt")
+
+
+# Now let's run it from R to BASH with "system()" function
+ md5_results <- system("cd data; md5sum -c md5.txt", intern = T)
+ 
+# md5 -c md5.txt > md5_check.txt
+ 
+ #TODO here is a solution to run system and get object:
+ # To output the md5_check as an R vector, add the "intern = TRUE" argument to the system() function:
+# md5_results <- system("cd 17/fastq; md5sum -c md5.txt", intern = TRUE)
+ #TODO check on system runs populating variables
+# Nice they all look correct -- but let's save this result
+# write.csv(md5_results, "md5_check.csv")
+```
+
+
+
+# md5sum check on file downloads
+Additionally from all of this information we've gathered we can create a text file to run the md5sum check.
+
+```{r md5sum of fastq}
+# Let's create an md5.txt to run the checksums
+# We will use the same approach for the mv script.
+md5 <- samples %>% 
+  ungroup() %>%
+  dplyr::select(md5sum, fastq_file) %>%
+  # note double space for md5 requirements 
+  unite(line, md5sum, fastq_file, sep = "  ")
+# writting out md5$line col that has the command in it from above.
+write_lines(md5$line, "md5.txt")
+# Now let's run it from R to BASH with "system()" function
+ md5_results <- system("cd fastq; md5sum -c md5.txt")
+ 
+# md5 -c md5.txt > md5_check.txt
+ 
+ #TODO here is a solution to run system and get object:
+ # To output the md5_check as an R vector, add the "intern = TRUE" argument to the system() function:
+# md5_results <- system("cd 17/fastq; md5sum -c md5.txt", intern = TRUE)
+ #TODO check on system runs populating variables
+# Nice they all look correct -- but let's save this result
+# write.csv(md5_results, "md5_check.csv")
+```
+
+# finalizing sample sheet for NF_CORE
+Finally, we can write out a nicely formatted sample sheet 
+that we will use downstream for further analysis of the read counts in R.
+
+```{r Reorganizing to make a sample sheet for DEseq2}
+# Let's create the sample sheet that we will use later
+# to do the RNA-seq analysis in R.
+samples <- samples %>%
+  dplyr::rename(fastq = fastq_file,
+                seq_type = Assay.title,
+                sample_name = Biosample.summary) %>%
+  # The minus sign will remove this column -- which we no longer need.
+  dplyr::select(-original_file) 
+```
+
+# final organization of sample sheet
+
+Now that we have it cleaned up, let's create one line for each replicate
+where the fastq read 1 and read 2 are in the same row.
+```{R organizing samplesheet }
+# For this we will use the pivot wider function
+# We need to tell the pivot_wider function which unique column combinations will specify each new row. 
+# PIVOT WIDER by "paired_end_identifier" 
+samplesheet <- samples %>%
+  #id_cols is a parameter in pivot wider to select the cols
+  # the paired end identifier becomes the "marienette" string of the data-frame.
+  # There are two values and thus all the current cols will be split into 2 (one for each pe-id)
+  pivot_wider(id_cols = c("sample_id", "seq_type", "sample_name"),
+              names_from = paired_end_identifier,
+              values_from = c("fastq", "md5sum"))
+# Cleaning up sample sheet (removing spaces - re-arrange etc)
+samplesheet <- samplesheet %>%
+  
+# cleaning up column "sample_name" that has spaces in it to replace with underscore
+mutate(condition = gsub(" ", "_", sample_name) %>% tolower()) %>%
+  
+# splitting up "sample_id" to extract replicate number (by "_" )
+separate(sample_id, into = c("experiment_accession", "replicate"), 
+           remove = FALSE, sep = "_") %>%
+  
+# replicate col values came from sample id and are currently rep1 or rep2
+# we want to remove the "rep" with gsub to "R" and iterative using mutate
+mutate(replicate = gsub("rep", "R", replicate)) %>%
+  
+# we are writting over the sample_name col and uniting condition and replicate info 
+# into the previous sample_name col. syntax: (data frame - implied from tidy, new_col_name, what to unite)
+unite(sample_name, condition, replicate, sep = "_", remove = FALSE)
+# here we are just changing the hepg2 total name to hepg2_total
+#TODO leaving out and could fix matching condition but not needed
+# samplesheet$condition[samplesheet$condition == "hepg2"] <- "hepg2_total"
+# FINAL cleanup of col names etc.
+samplesheet <- samplesheet %>%
+  
+  mutate(cell_type = "hepg2",
+         condition = gsub("hepg2_", "", condition)) %>%
+  
+  dplyr::select(sample_id, sample_name, replicate, condition,
+                cell_type, seq_type, fastq_1, fastq_2, md5sum_1,
+                md5sum_2)
+# that was a lot of work so let's save for future use :) 
+# Writting this out to 17_ test_2
+write_csv(samplesheet, "samplesheet.csv")
+```
+
+# design file
+We will eventually need a design file for RNA-seq (DEseq2)
+We are really close with samples sheet so let's finalize that.
+
+# Future RNAseq NF_Core runs require design file
+Newwer versions of NF_Core require a design file the version we are running does not.
+
+The design file needs to be in a specific format (as we saw with nf-core/chipseq)
+It needs the following columns:
+
+# sample,fastq_1,fastq_2,strandedness
+
+Let's create a sample column using mutate -- and we'll clean up the names
